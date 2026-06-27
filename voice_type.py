@@ -661,6 +661,11 @@ def inject_text(text, transcription_duration=None):
     restore_enabled = current_config.get("restore_clipboard", False)
     typing_mode = current_config.get("typing_mode", "clipboard")
 
+    # Fetch and store the original clipboard content before overwriting it
+    original_clipboard_content = None
+    if restore_enabled:
+        original_clipboard_content = get_clipboard_content()
+
     # Always copy to clipboard first so text is safe even if insertion fails.
     # We do this unconditionally (regardless of auto_copy flag) so the
     # transcription is never lost.
@@ -702,16 +707,14 @@ def inject_text(text, transcription_duration=None):
     # ------------------------------------------------------------------
     # Animated character-by-character injection
     # ------------------------------------------------------------------
-    # When transcription_duration is available and ydotool is present we
-    # use `ydotool type --key-delay <ms>` to produce a smooth reveal whose
-    # total wall-clock time matches the Whisper processing time.  This is
-    # purely a visual effect – the text is already safe in the clipboard.
+    # Use `ydotool type --key-delay <ms>` to produce a smooth reveal using
+    # a fixed human-like typing speed instead of AI processing time.
+    # We only animate short dictations (<= 50 chars) to prevent lag.
     # ------------------------------------------------------------------
     n_chars = len(text)
     use_animated = (
         transcription_duration is not None
-        and transcription_duration > 0.5
-        and n_chars >= 2
+        and n_chars <= 50
         and is_wayland
         and ydotool_bin is not None
     )
@@ -719,15 +722,11 @@ def inject_text(text, transcription_duration=None):
     paste_success = False
 
     if use_animated:
-        # Calculate per-key delay in milliseconds so the full text types
-        # out in exactly transcription_duration seconds.
-        # ydotool processes each character as one key-down+key-up pair, so
-        # the delay between events is:  duration_ms / n_chars
-        # We cap at 200 ms/char (very slow) and floor at 8 ms/char.
-        ms_per_char = max(8, min(200, int((transcription_duration * 1000) / n_chars)))
+        # Use a fixed realistic typing delay (e.g., 12 ms per character)
+        ms_per_char = 12
         logger.info(
             f"[inject_text] Animated injection: {n_chars} chars "
-            f"over {transcription_duration:.2f}s → {ms_per_char} ms/char"
+            f"→ {ms_per_char} ms/char"
         )
         ydotool_env = os.environ.copy()
         uid = os.getuid()
@@ -742,7 +741,7 @@ def inject_text(text, transcription_duration=None):
                 [
                     ydotool_bin, "type",
                     "--key-delay", str(ms_per_char),
-                    "--", text + " ",
+                    "--", text,
                 ],
                 env=ydotool_env,
                 capture_output=True,
@@ -846,12 +845,13 @@ def inject_text(text, transcription_duration=None):
     if paste_success:
         # Transcription remains in clipboard unless the user explicitly
         # opted in to restoring the old clipboard content.
-        if restore_enabled and clipboard_ok:
-            old_clipboard = get_clipboard_content()   # already set to text
-            # Re-fetch original BEFORE we overwrote it – not available here,
-            # so we intentionally skip restore when restore_clipboard=false.
-            pass
-        logger.info("[inject_text] Injection complete. Transcription in clipboard.")
+        if restore_enabled and clipboard_ok and original_clipboard_content is not None:
+            # Wait briefly for paste shortcut to complete before restoring clipboard
+            time.sleep(0.5)
+            set_clipboard_content(original_clipboard_content)
+            logger.info("[inject_text] Injection complete. Original clipboard restored.")
+        else:
+            logger.info("[inject_text] Injection complete. Transcription in clipboard.")
     else:
         # Paste failed entirely: transcription is already safe in clipboard.
         logger.error("[inject_text] All paste methods failed. Transcription preserved in clipboard.")
@@ -1339,8 +1339,14 @@ def run_daemon():
                                 speech_pad_ms=speech_pad_ms,
                                 min_speech_duration_ms=min_speech_duration_ms
                             )
-                            # Run VAD on the audio buffer
-                            segments = get_speech_timestamps(audio_buffer, local_vad_options)
+
+                            # Throttle VAD: Only run it every 5 chunks (~0.5s) to avoid exponential CPU spike
+                            if chunk_count % 5 == 0:
+                                # Run VAD on the audio buffer
+                                segments = get_speech_timestamps(audio_buffer, local_vad_options)
+                            else:
+                                # Skip processing for this chunk
+                                continue
                             
                             if open_mic_enabled:
                                 # First, check if buffer has grown too large (e.g. 15s) to prevent bloat/crashes
