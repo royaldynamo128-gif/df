@@ -877,6 +877,9 @@ def load_whisper_model():
         model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE_TYPE)
         logger.info(f"Model loaded successfully. Transcription engine is running on GPU: {DEVICE == 'cuda'}")
         model_loaded = True
+
+        # After successfully loading the model, update the health file to indicate status OK
+        write_health_status(whisper_loaded=True)
     except Exception as e:
         logger.error(f"Failed to load local Whisper model: {e}")
         sys.exit(1)
